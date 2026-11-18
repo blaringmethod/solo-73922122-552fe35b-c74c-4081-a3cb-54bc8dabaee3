@@ -10,6 +10,7 @@ Pages
 ``POST /api/harvest``          start a round
 ``POST /api/harvest/cancel``   cancel the active round without waiting for it
 ``POST /api/harvest/restart``  cancel (if any) and immediately start a new round
+``POST /api/runs/{id}/revoke`` revoke the most recent successful round
 """
 
 from __future__ import annotations
@@ -91,6 +92,7 @@ def create_app(
             "active": active,
             "published": published,
             "last_run": last[0] if last else None,
+            "revocable": store.revocable_run(),
             "config": {
                 "oai_url": config.oai_url,
                 "max_attempts": config.max_attempts,
@@ -115,6 +117,7 @@ def create_app(
                 "published": store.published_state(),
                 "status": status_payload(),
                 "runs": store.list_runs(limit=10),
+                "revocable": store.revocable_run(),
                 "message": message,
             },
         )
@@ -128,6 +131,7 @@ def create_app(
                 "runs": store.list_runs(limit=50),
                 "published": store.published_state(),
                 "status": status_payload(),
+                "revocable": store.revocable_run(),
             },
         )
 
@@ -179,6 +183,48 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return JSONResponse(
             {"run_id": control.run_id, "status": "running"}, status_code=202
+        )
+
+    @app.post("/api/runs/{run_id}/revoke")
+    async def revoke_run(run_id: str) -> JSONResponse:
+        """Revoke the most recent successful round, restoring its pre-state.
+
+        All guards live inside ``Store.revoke_run``'s single transaction:
+        only the latest successful round can be revoked, never while a
+        harvest is running, and repeating the same id is a harmless no-op.
+        """
+        result = store.revoke_run(run_id)
+        reason = result.get("reason")
+        if reason == "not_found":
+            raise HTTPException(status_code=404, detail="轮次不存在")
+        if reason == "already_revoked":
+            return JSONResponse(
+                {
+                    "run_id": run_id,
+                    "changed": False,
+                    "status": "already_revoked",
+                    "detail": "该轮次已撤销过，未重复执行",
+                }
+            )
+        if not result.get("revoked"):
+            messages = {
+                "harvest_running": "采集轮次正在进行，撤销被拒绝",
+                "not_succeeded": "该轮次未成功发布，不能撤销",
+                "not_latest": "只能撤销最近一次成功采集的轮次",
+                "no_snapshot": "该轮次发布时未留存撤销快照，无法撤销",
+            }
+            raise HTTPException(
+                status_code=409, detail=messages.get(reason, "无法撤销该轮次")
+            )
+        return JSONResponse(
+            {
+                "run_id": run_id,
+                "changed": True,
+                "status": "revoked",
+                "restored": result["restored"],
+                "removed": result["removed"],
+                "watermark": result["watermark"],
+            }
         )
 
     @app.get("/api/catalog")

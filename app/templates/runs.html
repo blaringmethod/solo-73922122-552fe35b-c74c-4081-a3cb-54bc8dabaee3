@@ -10,7 +10,7 @@
 <header class="topbar">
   <div>
     <h1>轮次记录</h1>
-    <p class="sub">只有成功轮次会同时提交目录与水位；失败与取消不改动已发布内容。</p>
+    <p class="sub">只有成功轮次会同时提交目录与水位；失败与取消不改动已发布内容。可撤销最近一次成功轮次以恢复该轮之前的目录与水位。</p>
   </div>
   <nav><a href="/">目录</a><a href="/runs">轮次记录</a><a href="/status">状态 JSON</a></nav>
 </header>
@@ -24,14 +24,17 @@
     <thead>
       <tr>
         <th>轮次</th><th>状态</th><th>时间窗（闭区间）</th><th>尝试</th>
-        <th>页</th><th>记录</th><th>分页重取</th><th>提交后水位</th><th>说明</th>
+        <th>页</th><th>记录</th><th>分页重取</th><th>提交后水位</th><th>说明</th><th>操作</th>
       </tr>
     </thead>
     <tbody>
     {% for run in runs %}
       <tr>
         <td class="mono">{{ run.id[:8] }}</td>
-        <td><span class="badge {{ run.status }}">{{ run.status }}</span></td>
+        <td>
+          <span class="badge {{ run.status }}">{{ run.status }}</span>
+          {% if run.revoked_at %}<span class="badge revoked">已撤销</span>{% endif %}
+        </td>
         <td class="mono small">{{ run.window_from or "（全量）" }} .. {{ run.window_until or "—" }}</td>
         <td>{{ run.attempt }}</td>
         <td>{{ run.pages_fetched }}</td>
@@ -39,15 +42,48 @@
         <td>{{ run.token_restarts }}</td>
         <td class="mono small">{{ run.watermark_after or "—" }}</td>
         <td class="small">
+          {% if run.revoked_at %}撤销于 {{ run.revoked_at }}：已恢复该轮之前的目录与水位。{% endif %}
           {% if run.cancel_reason %}取消：{{ run.cancel_reason }}{% endif %}
           {% if run.last_error %}{{ run.last_error }}{% endif %}
         </td>
+        <td>
+          {% if revocable and run.id == revocable.id %}
+          <button type="button" class="danger row-action btn-revoke-run"
+                  data-run-id="{{ run.id }}"
+                  {% if status.active %}disabled title="采集进行中，暂不能撤销"{% endif %}>撤销本轮</button>
+          {% endif %}
+        </td>
       </tr>
     {% else %}
-      <tr><td colspan="9" class="empty">还没有采集轮次。</td></tr>
+      <tr><td colspan="10" class="empty">还没有采集轮次。</td></tr>
     {% endfor %}
     </tbody>
   </table>
 </main>
+<script>
+(() => {
+  document.querySelectorAll(".btn-revoke-run").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const runId = btn.dataset.runId;
+      if (!runId) return;
+      if (!confirm("撤销该轮次？将恢复该轮之前的目录记录与发布水位，该轮会标记为已撤销。")) return;
+      btn.disabled = true;
+      try {
+        const response = await fetch(`/api/runs/${runId}/revoke`, { method: "POST" });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          alert(body.detail || "撤销失败");
+          btn.disabled = false;
+          return;
+        }
+        location.reload();
+      } catch (error) {
+        alert("请求失败：" + error.message);
+        btn.disabled = false;
+      }
+    });
+  });
+})();
+</script>
 </body>
 </html>

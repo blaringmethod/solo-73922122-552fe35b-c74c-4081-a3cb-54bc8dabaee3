@@ -99,6 +99,9 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .badge.succeeded { background: #e3f5ea; color: var(--ok); }
 .badge.failed { background: #fdecea; color: var(--danger); }
 .badge.cancelled { background: #fdf3e3; color: var(--warn); }
+.badge.revoked { background: #efe6fb; color: #6d28a8; }
+
+button.row-action { padding: 4px 10px; font-size: 12px; }
 
 .runlist { margin: 0; padding-left: 18px; font-size: 13px; }
 .runlist li { margin-bottom: 7px; line-height: 1.5; }

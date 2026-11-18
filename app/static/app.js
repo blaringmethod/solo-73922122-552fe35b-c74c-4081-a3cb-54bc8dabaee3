@@ -6,12 +6,14 @@
   const startBtn = document.getElementById("btn-start");
   const cancelBtn = document.getElementById("btn-cancel");
   const restartBtn = document.getElementById("btn-restart");
+  const revokeBtn = document.getElementById("btn-revoke");
   if (!area) return;
 
   let generation = 0;
   let busy = false;
   let seenActiveId = null;
   let initialised = false;
+  let revocableId = revokeBtn ? revokeBtn.dataset.runId || null : null;
 
   const activeId = (status) => (status.active ? status.active.id : null);
 
@@ -19,6 +21,12 @@
     String(value ?? "").replace(/[&<>"']/g, (c) => ({
       "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
     }[c]));
+
+  function renderRevoke(status) {
+    if (!revokeBtn) return;
+    revocableId = status.revocable ? status.revocable.id : null;
+    revokeBtn.disabled = busy || !!status.active || !revocableId;
+  }
 
   function render(status) {
     const active = status.active;
@@ -28,6 +36,7 @@
       startBtn.disabled = false;
       cancelBtn.disabled = true;
       restartBtn.disabled = false;
+      renderRevoke(status);
       return;
     }
     const pages = active.pages_fetched || 0;
@@ -50,6 +59,7 @@
     startBtn.disabled = true;
     cancelBtn.disabled = false;
     restartBtn.disabled = false;
+    renderRevoke(status);
   }
 
   function renderPublished(status, publishedEl, sizeEl) {
@@ -93,6 +103,7 @@
     if (busy) return;
     busy = true;
     startBtn.disabled = cancelBtn.disabled = restartBtn.disabled = true;
+    if (revokeBtn) revokeBtn.disabled = true;
     try {
       const response = await fetch(url, { method: "POST" });
       const body = await response.json().catch(() => ({}));
@@ -113,6 +124,36 @@
     post("/api/harvest/cancel");
   });
   restartBtn?.addEventListener("click", () => post("/api/harvest/restart"));
+  revokeBtn?.addEventListener("click", async () => {
+    const runId = revocableId;
+    if (!runId || busy) return;
+    if (
+      !confirm(
+        "撤销最近一次成功采集？将恢复该轮之前的目录记录与发布水位，" +
+          "该轮会在轮次记录中标记为已撤销。",
+      )
+    )
+      return;
+    busy = true;
+    revokeBtn.disabled = true;
+    try {
+      const response = await fetch(`/api/runs/${runId}/revoke`, { method: "POST" });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        alert(body.detail || "撤销失败");
+        busy = false;
+        await poll();
+        return;
+      }
+      // Catalogue and watermark changed: reload so every panel reflects the
+      // restored state (the poller only reloads on round start/finish).
+      location.reload();
+    } catch (error) {
+      alert("请求失败：" + error.message);
+      busy = false;
+      await poll();
+    }
+  });
 
   poll();
   setInterval(poll, 1000);

@@ -84,15 +84,21 @@
       <button id="btn-start" class="primary" type="button">开始新一轮</button>
       <button id="btn-cancel" class="danger" type="button">取消当前轮次</button>
       <button id="btn-restart" type="button">取消并立即重开</button>
+      <button id="btn-revoke" class="danger" type="button"
+              data-run-id="{{ revocable.id if revocable else '' }}"
+              {% if not revocable %}disabled{% endif %}>撤销最近一次成功采集</button>
     </div>
     <p class="hint">“取消”与“取消并立即重开”都不等待慢页返回：旧轮立即作废，不会发布；
     重开时新轮马上开始，旧轮迟到的响应不会改动新轮状态。</p>
+    <p class="hint">“撤销最近一次成功采集”用于源端误更正/误撤回已发布的情形：恢复该轮之前的
+    目录记录与发布水位，并在轮次记录中标记“已撤销”。采集进行中不可撤销。</p>
 
     <h3>最近轮次</h3>
     <ol class="runlist" id="run-history">
       {% for run in runs %}
       <li>
         <span class="badge {{ run.status }}">{{ run.status }}</span>
+        {% if run.revoked_at %}<span class="badge revoked">已撤销</span>{% endif %}
         <span class="mono">{{ run.started_at[11:19] }}</span>
         <span>{{ (run.window_from or "全量") }} → {{ run.window_until or "—" }}</span>
         <span class="muted">页 {{ run.pages_fetched }} · 记录 {{ run.records_seen }}</span>

@@ -5,6 +5,16 @@ database.  A harvest round writes into ``run_records`` (a per-run staging
 area) and only the final commit transaction copies staging into ``catalog``
 and advances the watermark.  This is what makes a failed or interrupted
 round a no-op for readers of the published catalogue.
+
+Revocation (undo) of the most recent successful round is supported by
+retaining, inside the same commit transaction, the pre-round state:
+``run_pre_state`` stores the watermark / last-successful-run pointer as they
+were before the round published, and ``run_snapshots`` stores the catalogue
+row of every identifier the round touched (or that it did not exist).
+``revoke_run`` then restores exactly those rows and pointers in one
+transaction and marks the round revoked, so a mistaken correction or
+withdrawal published from the source can be rolled back before the source
+itself is fixed.
 """
 
 from __future__ import annotations
@@ -39,6 +49,7 @@ class Store:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._init_schema()
+        self._migrate_revoke_support()
         self._recover_interrupted_runs()
         self._ensure_invariants()
 
@@ -77,7 +88,8 @@ class Store:
                     phase TEXT,
                     last_error TEXT,
                     cancel_reason TEXT,
-                    watermark_after TEXT
+                    watermark_after TEXT,
+                    revoked_at TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS run_records (
@@ -88,6 +100,34 @@ class Store:
                     datestamp TEXT NOT NULL,
                     deleted INTEGER NOT NULL DEFAULT 0,
                     seq INTEGER NOT NULL,
+                    PRIMARY KEY (run_id, identifier),
+                    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+                );
+
+                -- Pre-round publish pointers, captured inside the commit
+                -- transaction.  A row exists exactly when the round was
+                -- committed with revoke support; rounds committed before
+                -- this feature existed have no row and cannot be revoked.
+                CREATE TABLE IF NOT EXISTS run_pre_state (
+                    run_id TEXT PRIMARY KEY,
+                    watermark TEXT,
+                    last_run_id TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+                );
+
+                -- Pre-round catalogue row for every identifier the round
+                -- touched.  existed = 0 means the identifier was absent
+                -- before the round (revoke deletes it); existed = 1 means
+                -- the stored values are the ones revoke restores.
+                CREATE TABLE IF NOT EXISTS run_snapshots (
+                    run_id TEXT NOT NULL,
+                    identifier TEXT NOT NULL,
+                    existed INTEGER NOT NULL,
+                    title TEXT,
+                    creator TEXT,
+                    source_datestamp TEXT,
+                    harvested_at TEXT,
                     PRIMARY KEY (run_id, identifier),
                     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
                 );
@@ -107,6 +147,24 @@ class Store:
                 VALUES (1, NULL, NULL, 0, NULL);
                 """
             )
+
+    def _migrate_revoke_support(self) -> None:
+        """Add revoke-related columns to databases created before them.
+
+        ``CREATE TABLE IF NOT EXISTS`` never alters an existing ``runs``
+        table, so legacy databases get ``revoked_at`` via ``ALTER TABLE``
+        (fresh databases already have it from the CREATE above, making this
+        a no-op for them).
+        """
+        with self._lock:
+            cols = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(runs)")
+            }
+            if "revoked_at" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE runs ADD COLUMN revoked_at TEXT"
+                )
 
     def _recover_interrupted_runs(self) -> None:
         """A previous process died.  No in-memory task can own these runs."""
@@ -475,9 +533,55 @@ class Store:
                 ).fetchall()
 
                 now = utc_now_millis()
+
+                # Retain the pre-round state so this round can be revoked
+                # later: the publish pointers as they are right now, plus
+                # the catalogue row (or absence) of every touched identifier.
+                state = self._conn.execute(
+                    "SELECT watermark, last_run_id FROM published_state"
+                    " WHERE id = 1"
+                ).fetchone()
+                self._conn.execute(
+                    """
+                    INSERT INTO run_pre_state
+                        (run_id, watermark, last_run_id, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        state["watermark"] if state else None,
+                        state["last_run_id"] if state else None,
+                        now,
+                    ),
+                )
+
                 upserts = 0
                 deletions = 0
                 for row in rows:
+                    existing = self._conn.execute(
+                        """
+                        SELECT title, creator, source_datestamp, harvested_at
+                          FROM catalog WHERE identifier = ?
+                        """,
+                        (row["identifier"],),
+                    ).fetchone()
+                    self._conn.execute(
+                        """
+                        INSERT INTO run_snapshots
+                            (run_id, identifier, existed, title, creator,
+                             source_datestamp, harvested_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            run_id,
+                            row["identifier"],
+                            1 if existing else 0,
+                            existing["title"] if existing else None,
+                            existing["creator"] if existing else None,
+                            existing["source_datestamp"] if existing else None,
+                            existing["harvested_at"] if existing else None,
+                        ),
+                    )
                     if row["deleted"]:
                         self._conn.execute(
                             "DELETE FROM catalog WHERE identifier = ?",
@@ -586,6 +690,146 @@ class Store:
                 self._clear_active_if(run_id)
                 self._conn.execute("COMMIT")
                 return cur.rowcount > 0
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    # ----------------------------------------------------------------- revoke
+    def revocable_run(self) -> dict[str, Any] | None:
+        """The round a revoke action would currently target, if any.
+
+        This is always the most recent successful, not-yet-revoked round —
+        the one ``published_state.last_run_id`` points at.
+        """
+        with self._lock:
+            state = self._conn.execute(
+                "SELECT last_run_id FROM published_state WHERE id = 1"
+            ).fetchone()
+            if state is None or not state["last_run_id"]:
+                return None
+            run = self.get_run(state["last_run_id"])
+            if run and run["status"] == "succeeded" and not run["revoked_at"]:
+                return run
+            return None
+
+    def revoke_run(self, run_id: str) -> dict[str, Any]:
+        """Roll back the most recent successful round, atomically.
+
+        Restores the catalogue rows the round touched, the publish
+        watermark and the last-successful-run pointer, and marks the round
+        revoked.  Everything happens inside one IMMEDIATE transaction, so a
+        failure or crash leaves either the old or the new state, never a
+        mixture — and a repeated request for the same id is a no-op that can
+        never reach an earlier round.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                run = self._conn.execute(
+                    "SELECT * FROM runs WHERE id = ?", (run_id,)
+                ).fetchone()
+                if run is None:
+                    self._conn.execute("ROLLBACK")
+                    return {"revoked": False, "reason": "not_found"}
+                if run["revoked_at"]:
+                    # Idempotent: the round is already revoked.  Changing
+                    # nothing here is what stops a repeated request from
+                    # rolling back the *previous* successful round.
+                    self._conn.execute("ROLLBACK")
+                    return {"revoked": False, "reason": "already_revoked"}
+                if run["status"] != "succeeded":
+                    self._conn.execute("ROLLBACK")
+                    return {
+                        "revoked": False,
+                        "reason": "not_succeeded",
+                        "status": run["status"],
+                    }
+                running = self._conn.execute(
+                    "SELECT 1 FROM runs WHERE status = 'running' LIMIT 1"
+                ).fetchone()
+                if running is not None:
+                    # A harvest has already started; refuse rather than
+                    # pulling the watermark out from under it.
+                    self._conn.execute("ROLLBACK")
+                    return {"revoked": False, "reason": "harvest_running"}
+                state = self._conn.execute(
+                    "SELECT * FROM published_state WHERE id = 1"
+                ).fetchone()
+                if state is None or state["last_run_id"] != run_id:
+                    self._conn.execute("ROLLBACK")
+                    return {"revoked": False, "reason": "not_latest"}
+                pre = self._conn.execute(
+                    "SELECT * FROM run_pre_state WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                if pre is None:
+                    # Committed before revoke support existed: nothing was
+                    # retained, so there is nothing safe to restore.
+                    self._conn.execute("ROLLBACK")
+                    return {"revoked": False, "reason": "no_snapshot"}
+
+                snapshots = self._conn.execute(
+                    """
+                    SELECT * FROM run_snapshots
+                     WHERE run_id = ? ORDER BY identifier
+                    """,
+                    (run_id,),
+                ).fetchall()
+                restored = 0
+                removed = 0
+                for snap in snapshots:
+                    if snap["existed"]:
+                        self._conn.execute(
+                            """
+                            INSERT INTO catalog
+                                (identifier, title, creator, source_datestamp,
+                                 harvested_at)
+                            VALUES (?, ?, ?, ?, ?)
+                            ON CONFLICT(identifier) DO UPDATE SET
+                                title = excluded.title,
+                                creator = excluded.creator,
+                                source_datestamp = excluded.source_datestamp,
+                                harvested_at = excluded.harvested_at
+                            """,
+                            (
+                                snap["identifier"],
+                                snap["title"] or "",
+                                snap["creator"],
+                                snap["source_datestamp"],
+                                snap["harvested_at"],
+                            ),
+                        )
+                        restored += 1
+                    else:
+                        self._conn.execute(
+                            "DELETE FROM catalog WHERE identifier = ?",
+                            (snap["identifier"],),
+                        )
+                        removed += 1
+
+                now = utc_now_millis()
+                self._conn.execute(
+                    """
+                    UPDATE published_state
+                       SET watermark = ?,
+                           updated_at = ?,
+                           success_count = MAX(success_count - 1, 0),
+                           last_run_id = ?
+                     WHERE id = 1
+                    """,
+                    (pre["watermark"], now, pre["last_run_id"]),
+                )
+                self._conn.execute(
+                    "UPDATE runs SET revoked_at = ? WHERE id = ?",
+                    (now, run_id),
+                )
+                self._conn.execute("COMMIT")
+                return {
+                    "revoked": True,
+                    "restored": restored,
+                    "removed": removed,
+                    "watermark": pre["watermark"],
+                    "revoked_at": now,
+                }
             except BaseException:
                 self._conn.execute("ROLLBACK")
                 raise
